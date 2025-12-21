@@ -2,13 +2,11 @@ name: Global Market Monitor Parallel
 
 on:
   schedule:
-    # 台北時間週一至週五 18:30 (自動執行)
     - cron: '30 10 * * 1-5'
   workflow_dispatch:
-    # --- 這裡就是選單出現的關鍵 ---
     inputs:
       market_choice:
-        description: '選擇市場 (Select Market: all 代表全部並行)'
+        description: '選擇市場 (Select Market)'
         required: true
         default: 'all'
         type: choice
@@ -28,7 +26,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 定義所有可能的市場
         market:
           - { id: "tw-share", name: "Taiwan", emoji: "🇹🇼" }
           - { id: "us-share", name: "US",     emoji: "🇺🇸" }
@@ -37,9 +34,7 @@ jobs:
           - { id: "jp-share", name: "Japan",  emoji: "🇯🇵" }
           - { id: "kr-share", name: "Korea",  emoji: "🇰🇷" }
     
-    # 這裡加入一個判斷式：
-    # 如果選單選 'all'，則矩陣內所有市場都跑。
-    # 如果選單選了特定市場（如 'tw-share'），則只有符合該 ID 的矩陣任務會執行。
+    # 這裡的縮排必須與 runs-on 對齊
     if: |
       github.event_name == 'schedule' || 
       github.event.inputs.market_choice == 'all' || 
