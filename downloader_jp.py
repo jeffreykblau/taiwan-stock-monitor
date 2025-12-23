@@ -34,7 +34,7 @@ os.makedirs(LIST_DIR, exist_ok=True)
 # 狀態管理檔案
 MANIFEST_CSV = Path(LIST_DIR) / "jp_manifest.csv"
 LIST_ALL_CSV = Path(LIST_DIR) / "jp_list_all.csv"
-THREADS = 4 # GitHub Actions 環境建議 4，避免封 IP
+THREADS = 4 # GitHub Actions 環境建議 4，避免封鎖 IP
 
 def log(msg: str):
     print(f"{pd.Timestamp.now():%H:%M:%S}: {msg}")
@@ -83,10 +83,12 @@ def build_manifest(df_list):
         # 確保新的 code 若不在 mf 裡則加入
         new_codes = df_list[~df_list['code'].astype(str).isin(mf['code'].astype(str))]
         if not new_codes.empty:
-            new_codes['status'] = 'pending'
-            mf = pd.concat([mf, new_codes], ignore_index=True)
+            new_codes_df = new_codes.copy()
+            new_codes_df['status'] = 'pending'
+            mf = pd.concat([mf, new_codes_df], ignore_index=True)
         return mf
     
+    df_list = df_list.copy()
     df_list["status"] = "pending"
     # 掃描資料夾，將已存在的檔案標記為 done
     existing_files = {f.split(".")[0] for f in os.listdir(DATA_DIR) if f.endswith(".T.csv")}
@@ -119,65 +121,80 @@ def download_one(row_tuple):
                 if 'date' in df_raw.columns:
                     df_raw['date'] = pd.to_datetime(df_raw['date'], utc=True).dt.tz_localize(None)
                 
-                # 僅保留核心欄位，節省空間
+                # 僅保留核心欄位
                 cols = ['date','open','high','low','close','volume']
                 df_final = df_raw[[c for c in cols if c in df_raw.columns]]
                 df_final.to_csv(out_path, index=False, encoding='utf-8-sig')
                 return idx, "done"
             
-            # 若為空數據且是最後一次嘗試
             if attempt == max_retries - 1:
                 return idx, "empty"
 
         except Exception:
             if attempt == max_retries - 1:
                 return idx, "failed"
-            # 失敗後冷卻時間增加
             time.sleep(random.randint(3, 7))
             
     return idx, "failed"
 
 def main():
-    log("🇯🇵 日本股市 K 線同步器啟動 (GitHub Actions 高成功率版)")
+    log("🇯🇵 日本股市 K 線同步器啟動 (數據統計優化版)")
+    
+    # 1. 獲取清單與 Manifest
     df_list = get_tse_list()
     if df_list.empty: 
         log("🚨 無法取得清單，結束程序。")
         return
-
     mf = build_manifest(df_list)
-    # 僅處理 pending 與 failed 的標的
+
+    # 2. 篩選待處理標的 (排除已成功或確定沒資料的)
     todo = mf[~mf["status"].isin(["done", "empty"])]
     
-    if todo.empty:
-        log("✅ 所有日股資料已是最新，無需下載。")
-        return
+    if not todo.empty:
+        log(f"📝 待處理標的數：{len(todo)} 檔 (含重試之前失敗項)")
+        with ThreadPoolExecutor(max_workers=THREADS) as executor:
+            futures = {executor.submit(download_one, item): item for item in todo.iterrows()}
+            pbar = tqdm(total=len(todo), desc="日股下載進度")
+            count = 0
+            try:
+                for f in as_completed(futures):
+                    idx, status = f.result()
+                    mf.at[idx, "status"] = status
+                    count += 1
+                    pbar.update(1)
+                    if count % 100 == 0:
+                        mf.to_csv(MANIFEST_CSV, index=False)
+            except KeyboardInterrupt:
+                log("🛑 使用者中斷下載...")
+            finally:
+                mf.to_csv(MANIFEST_CSV, index=False)
+                pbar.close()
+    else:
+        log("✅ 數據已是最新狀態，無需下載新標的。")
 
-    log(f"📝 待處理標的數：{len(todo)} 檔 (包含之前失敗重試)")
+    # 3. 計算數據統計 (用於 Email 通知)
+    total_expected = len(mf)
+    # 有效成功 = 狀態為 'done' 的總數 (包含歷史快取 + 本次新抓)
+    effective_success = len(mf[mf['status'] == 'done'])
+    fail_count = total_expected - effective_success
 
-    with ThreadPoolExecutor(max_workers=THREADS) as executor:
-        futures = {executor.submit(download_one, item): item for item in todo.iterrows()}
-        pbar = tqdm(total=len(todo), desc="日股下載進度")
-        
-        count = 0
-        try:
-            for f in as_completed(futures):
-                idx, status = f.result()
-                mf.at[idx, "status"] = status
-                count += 1
-                pbar.update(1)
-                
-                # 每 100 檔強制存檔一次 Manifest
-                if count % 100 == 0:
-                    mf.to_csv(MANIFEST_CSV, index=False)
-        except KeyboardInterrupt:
-            log("🛑 使用者中斷，正在儲存進度...")
-        finally:
-            mf.to_csv(MANIFEST_CSV, index=False)
-            pbar.close()
+    download_stats = {
+        "total": total_expected,
+        "success": effective_success,
+        "fail": fail_count
+    }
 
-    success_count = len(mf[mf['status'] == 'done'])
-    log(f"📊 下載報告: 成功={success_count}, 失敗/空值={len(mf) - success_count}")
-    log("✨ 準備進入矩陣分析階段...")
+    log("="*30)
+    log(f"📊 下載統計報告:")
+    log(f"   - 應收總數: {total_expected}")
+    log(f"   - 成功(含舊檔): {effective_success}")
+    log(f"   - 失敗/無數據: {fail_count}")
+    log(f"   - 數據完整度: {(effective_success/total_expected)*100:.2f}%")
+    log("="*30)
+
+    # 4. 回傳統計數據供後續 notifier.py 使用
+    # 在 GitHub Actions 流程中，你可以將此 dictionary 傳遞給發信函數
+    return download_stats
 
 if __name__ == "__main__":
     main()
